@@ -26,7 +26,7 @@ for d in [RAW_DIR, DATA_DIR, PREPROCESSED_DIR, MODELS_DIR, RESULTS_DIR]:
 
 # 사용하려는 청크 사이즈 파일 이름(확장자 제외)
 # 필요시 여기만 수정하거나, os.listdir 기반으로 자동화해도 됨
-CHUNK_SIZES = ["1MB", "2MB"]  # 예시
+CHUNK_SIZES = ["1MB", "4MB"]  # 예시
 
 # 사용 코덱 및 각 코덱에 대응하는 컬럼명
 CODECS = {
@@ -52,13 +52,23 @@ RANDOM_SEED = 42
 
 # pipeline/common.py
 
+# XGB_DEFAULT_PARAMS = {
+#     "objective": "multi:softmax",
+#     "tree_method": "hist",   # ✅ CPU용 (gpu_hist 대신 hist)
+#     "eval_metric": "mlogloss",
+#     "learning_rate": 0.1,
+#     "max_depth": 6,
+#     "n_estimators": 300,
+# }
+
 XGB_DEFAULT_PARAMS = {
     "objective": "multi:softmax",
-    "tree_method": "hist",   # ✅ CPU용 (gpu_hist 대신 hist)
+    "tree_method": "hist",     # GPU에서도 hist + device="cuda" 조합 권장
     "eval_metric": "mlogloss",
     "learning_rate": 0.1,
     "max_depth": 6,
     "n_estimators": 300,
+    "device": "cuda",          # ✅ GPU 사용
 }
 
 
