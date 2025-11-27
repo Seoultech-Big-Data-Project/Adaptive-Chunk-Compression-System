@@ -1,15 +1,12 @@
 """
 콘텐츠 패턴 특성 추출
-바이트 타입별 비율 계산 (텍스트, JSON, Base64, Hex 등)
+바이트 타입별 비율 계산
 """
 
 
 def proportion_features(data: bytes):
     """
     바이트 타입별 비율(proportion) 특성 추출
-    
-    데이터의 내용 유형을 파악하기 위해 특정 바이트 패턴의 비율을 계산합니다.
-    각 비율은 0.0 ~ 1.0 사이의 값으로, 전체 데이터 중 해당 패턴이 차지하는 비중을 나타냅니다.
     
     추출하는 비율:
     - prop_zero: 0x00 바이트 비율 (null 바이트, 바이너리 데이터에 많음)
@@ -23,12 +20,6 @@ def proportion_features(data: bytes):
     - prop_base64_charset: Base64 문자 비율 (A-Z, a-z, 0-9, +, /, =)
     - prop_hex_charset: 16진수 문자 비율 (0-9, A-F, a-f)
     - prop_printable_non_ascii: ASCII 범위 밖의 출력 가능 문자 비율 (0x80-0xFF)
-    
-    Args:
-        data: 분석할 바이트 데이터
-    
-    Returns:
-        dict: 각 비율 특성을 담은 딕셔너리
     """
     length = len(data)
     if length == 0:
@@ -46,7 +37,6 @@ def proportion_features(data: bytes):
             "prop_printable_non_ascii": 0.0,
         }
 
-    # 각 특성별 카운터 초기화
     zero = ff = ascii_ = control = 0
     newline = space = 0
     json_brace = json_punct = 0
@@ -101,7 +91,6 @@ def proportion_features(data: bytes):
         if 0x80 <= b <= 0xFF:
             printable_non_ascii += 1
 
-    # 카운트를 전체 길이로 나누어 비율(0.0~1.0) 계산
     length_f = float(length)
     return {
         "prop_zero": zero / length_f,                          # NULL 바이트 비율

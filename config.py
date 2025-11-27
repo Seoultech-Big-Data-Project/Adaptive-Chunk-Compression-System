@@ -23,6 +23,14 @@ for _d in [PREPROCESSED_DIR, MODELS_DIR, RESULTS_DIR]:
 # 실제 사용 중인 청크 사이즈만 넣어두면 됨
 CHUNK_SIZES = ["1MB", "2MB"]  # 필요시 추가
 
+# Feature 추출용 청크 크기별 CSV 파일 매핑 (1/4/8/16 MB)
+FEATURE_EXTRACT_CHUNK_SIZES = {
+    1 * 1024 * 1024: DATA_DIR / "1MB.csv",
+    4 * 1024 * 1024: DATA_DIR / "4MB.csv",
+    8 * 1024 * 1024: DATA_DIR / "8MB.csv",
+    16 * 1024 * 1024: DATA_DIR / "16MB.csv"
+}
+
 # 사용 코덱 리스트 (compression_* CSV, preprocess에서 모두 이 이름 기준)
 CODECS = ["zstd", "lz4", "snappy"]
 
