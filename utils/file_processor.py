@@ -6,6 +6,8 @@
 import math
 from pathlib import Path
 from tqdm import tqdm
+from multiprocessing import Pool, cpu_count
+from config import MAX_WORKERS
 
 from features import (
     shannon_entropy,
@@ -43,7 +45,7 @@ def compute_chunk_features(data: bytes, file_path: Path, chunk_idx: int, chunk_s
     # === 2. 모든 특성을 하나의 딕셔너리로 결합 ===
     row = {
         # 메타 정보
-        "file_path": str(file_path),              # 원본 파일 경로
+        # "file_path": str(file_path),              # 원본 파일 경로
         "chunk_index": chunk_idx,                 # 청크 순번
         "target_chunk_size": chunk_size_target,   # 목표 청크 크기
         "chunk_size": size,                       # 실제 청크 크기
@@ -71,29 +73,49 @@ def compute_chunk_features(data: bytes, file_path: Path, chunk_idx: int, chunk_s
     return row
 
 
-def process_file(file_path: Path, target_chunk_size: int):
+def _process_chunk_wrapper(args):
+    chunk, file_path, idx, target_size = args
+    return compute_chunk_features(chunk, file_path, idx, target_size)
+
+
+def process_file(file_path: Path, target_chunk_size: int, use_multiprocessing: bool = True):
     """
     특정 청크 크기로 파일을 분할하여 각 청크의 특성 추출
     """
-    rows = []
     file_size = file_path.stat().st_size 
 
     print(f"      Reading file ({file_size / (1024*1024):.1f} MB)...")
     with file_path.open("rb") as f:
         data = f.read()
 
-    # 필요한 청크 개수 계산 (올림)
     num_chunks = math.ceil(file_size / target_chunk_size) if file_size > 0 else 1
-    print(f"      Processing {num_chunks} chunk(s)...")
     
-    # 각 청크를 순회하며 특성 추출
-    for i in tqdm(range(num_chunks), desc="        Chunks", leave=False, unit="chunk"):
+    chunk_args = []
+    for i in range(num_chunks):
         start = i * target_chunk_size          
         end = min(start + target_chunk_size, file_size)
         chunk = data[start:end]
+        chunk_args.append((chunk, file_path, i, target_chunk_size))
+    
+    # 멀티 프로세싱 사용 여부에 따라 처리
+    if use_multiprocessing and num_chunks > 1:
+        num_workers = min(cpu_count(), MAX_WORKERS, num_chunks)
+        print(f"      Processing {num_chunks} chunk(s) with {num_workers} workers...")
         
-        # 청크의 모든 특성 계산
-        row = compute_chunk_features(chunk, file_path, i, target_chunk_size)
-        rows.append(row)
+        with Pool(processes=num_workers) as pool:
+            rows = list(tqdm(
+                pool.imap(_process_chunk_wrapper, chunk_args),
+                total=num_chunks,
+                desc="        Chunks",
+                leave=False,
+                unit="chunk"
+            ))
+    else:
+        # 단일 프로세스로 순차 처리
+        print(f"      Processing {num_chunks} chunk(s) (single process)...")
+        rows = []
+        for args in tqdm(chunk_args, desc="        Chunks", leave=False, unit="chunk"):
+            row = _process_chunk_wrapper(args)
+            rows.append(row)
 
     return rows

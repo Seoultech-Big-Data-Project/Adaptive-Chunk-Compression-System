@@ -3,6 +3,11 @@
 from pathlib import Path
 
 # ----------------------
+# 멀티프로세싱 설정
+# ----------------------
+MAX_WORKERS = 32
+
+# ----------------------
 # 경로 설정
 # ----------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
