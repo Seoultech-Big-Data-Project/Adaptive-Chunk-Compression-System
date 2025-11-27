@@ -1,76 +1,35 @@
 # main.py
-
 import argparse
 
-from config import CHUNK_SIZES
-from preprocess import preprocess_one_chunk_size
-from train_model import train_for_chunk_size
-from benchmark import benchmark_for_chunk_size
-
-
-def run_pipeline_for_chunk_size(chunk_size: str, do_preprocess: bool, do_train: bool, do_benchmark: bool):
-    print(f"\n=== PIPELINE START: chunk_size = {chunk_size} ===")
-
-    if do_preprocess:
-        print(f"[main] preprocess 단계 실행 (chunk_size={chunk_size})")
-        preprocess_one_chunk_size(chunk_size)
-    else:
-        print(f"[main] preprocess 단계 건너뜀 (chunk_size={chunk_size})")
-
-    if do_train:
-        print(f"[main] train 단계 실행 (chunk_size={chunk_size})")
-        train_for_chunk_size(chunk_size)
-    else:
-        print(f"[main] train 단계 건너뜀 (chunk_size={chunk_size})")
-
-    if do_benchmark:
-        print(f"[main] benchmark 단계 실행 (chunk_size={chunk_size})")
-        benchmark_for_chunk_size(chunk_size)
-    else:
-        print(f"[main] benchmark 단계 건너뜀 (chunk_size={chunk_size})")
-
-    print(f"=== PIPELINE END: chunk_size = {chunk_size} ===\n")
+from pipeline.preprocess import run_all_preprocess
+from pipeline.trainer import run_all_train
+from pipeline.benchmark import run_all_benchmarks
+from pipeline.common import log
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="압축 코덱 추천 전체 파이프라인 실행 스크립트"
-    )
+    parser = argparse.ArgumentParser(description="Compression codec selection pipeline")
     parser.add_argument(
-        "--chunk-size",
-        type=str,
-        default=None,
-        help="특정 청크 사이즈만 실행하고 싶을 때 (예: 1MB). 지정하지 않으면 config.CHUNK_SIZES 전체 실행.",
+        "--stage",
+        choices=["preprocess", "train", "benchmark", "all"],
+        default="all",
+        help="실행할 단계 선택",
     )
-    parser.add_argument(
-        "--no-preprocess",
-        action="store_true",
-        help="preprocess 단계 건너뛰기 (이미 preprocessed/*.csv 있는 경우)",
-    )
-    parser.add_argument(
-        "--no-train",
-        action="store_true",
-        help="train 단계 건너뛰기 (이미 models/*/model.pkl 있는 경우)",
-    )
-    parser.add_argument(
-        "--no-benchmark",
-        action="store_true",
-        help="benchmark 단계 건너뛰기",
-    )
-
     args = parser.parse_args()
 
-    do_preprocess = not args.no_preprocess
-    do_train = not args.no_train
-    do_benchmark = not args.no_benchmark
+    if args.stage in ("preprocess", "all"):
+        log("==== [1/3] Preprocess 단계 시작 ====")
+        run_all_preprocess()
 
-    if args.chunk_size:
-        # 특정 청크 사이즈만 실행
-        run_pipeline_for_chunk_size(args.chunk_size, do_preprocess, do_train, do_benchmark)
-    else:
-        # config.CHUNK_SIZES 전체에 대해 실행
-        for cs in CHUNK_SIZES:
-            run_pipeline_for_chunk_size(cs, do_preprocess, do_train, do_benchmark)
+    if args.stage in ("train", "all"):
+        log("==== [2/3] Train 단계 시작 ====")
+        run_all_train()
+
+    if args.stage in ("benchmark", "all"):
+        log("==== [3/3] Benchmark 단계 시작 ====")
+        run_all_benchmarks()
+
+    log("==== 파이프라인 실행 완료 ====")
 
 
 if __name__ == "__main__":
