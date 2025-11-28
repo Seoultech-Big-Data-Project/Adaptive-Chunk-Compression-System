@@ -26,8 +26,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import MAX_WORKERS, TEST_CODECS, DATA_BENCHMARK_DIR, MODELS_DIR, RESULTS_DIR
-from pipeline.features import compute_basic_stats, add_best_codec_label_by_cost
-from features.compression import compress
+from features.compression import compress, test_all_compressions
 from utils.file_processor import compute_chunk_features
 
 
@@ -106,8 +105,8 @@ def extract_features_parallel(chunks: list[bytes], use_multiprocessing: bool = T
         print(f"[benchmark_v2] extracting features (single process)...")
         features_list = []
         sizes = []
-        for chunk in chunks:
-            features = compute_basic_stats(chunk)
+        for idx, chunk in enumerate(chunks):
+            features = _extract_and_predict_task((chunk, idx))[1]
             features_list.append(features)
             sizes.append(len(chunk))
     
@@ -175,19 +174,9 @@ def compress_with_oracle(chunks: list[bytes], use_multiprocessing: bool = True) 
     print(f"[benchmark_v2] finding best codec for each chunk (oracle based on cost)...")
     
     # 모든 코덱으로 압축하여 DataFrame 생성
-    rows = []
+    best_codecs = []
     for i, chunk in enumerate(chunks):
-        row = {"chunk_idx": i}
-        for codec in TEST_CODECS:
-            size, time_ms, ratio = compress(chunk, codec)
-            row[f"{codec}_ratio"] = ratio
-            row[f"{codec}_time_ms"] = time_ms
-        rows.append(row)
-    
-    df = pd.DataFrame(rows)
-    
-    df = add_best_codec_label_by_cost(df)
-    best_codecs = df["best_codec"].tolist()
+        best_codecs.append(test_all_compressions(chunk)["best_cost"])
     
     # best codec으로 재압축
     return compress_chunks_parallel(chunks, best_codecs, use_multiprocessing)
@@ -228,15 +217,21 @@ def benchmark_file(file_path: Path, chunk_size_mb: int, model, classes: list[str
     
     # 4-1. Always ZSTD
     print(f"[benchmark_v2]   - always_zstd...")
-    metrics_zstd = compress_with_single_codec(chunks, "zstd", use_multiprocessing=True)
+    metrics_zstd = compress_with_single_codec(chunks, "zstd", use_multiprocessing=False)
+    print(f"[benchmark_v2]   - always_zstd (parallel)...")
+    metrics_zstd_parallel = compress_with_single_codec(chunks, "zstd", use_multiprocessing=True)
     
     # 4-2. Always LZ4
     print(f"[benchmark_v2]   - always_lz4...")
-    metrics_lz4 = compress_with_single_codec(chunks, "lz4", use_multiprocessing=True)
+    metrics_lz4 = compress_with_single_codec(chunks, "lz4", use_multiprocessing=False)
+    print(f"[benchmark_v2]   - always_lz4 (parallel)...")
+    metrics_lz4_parallel = compress_with_single_codec(chunks, "lz4", use_multiprocessing=True)
     
     # 4-3. Always Snappy
     print(f"[benchmark_v2]   - always_snappy...")
-    metrics_snappy = compress_with_single_codec(chunks, "snappy", use_multiprocessing=True)
+    metrics_snappy = compress_with_single_codec(chunks, "snappy", use_multiprocessing=False)
+    print(f"[benchmark_v2]   - always_snappy (parallel)...")
+    metrics_snappy_parallel = compress_with_single_codec(chunks, "snappy", use_multiprocessing=True)
     
     # 4-4. Oracle
     print(f"[benchmark_v2]   - oracle...")
@@ -256,8 +251,11 @@ def benchmark_file(file_path: Path, chunk_size_mb: int, model, classes: list[str
     
     total_orig = sum(sizes)
     metrics_zstd["throughput_mb_s"] = calc_throughput(total_orig, metrics_zstd["total_time_ms"])
+    metrics_zstd_parallel["throughput_mb_s"] = calc_throughput(total_orig, metrics_zstd_parallel["total_time_ms"])
     metrics_lz4["throughput_mb_s"] = calc_throughput(total_orig, metrics_lz4["total_time_ms"])
+    metrics_lz4_parallel["throughput_mb_s"] = calc_throughput(total_orig, metrics_lz4_parallel["total_time_ms"])
     metrics_snappy["throughput_mb_s"] = calc_throughput(total_orig, metrics_snappy["total_time_ms"])
+    metrics_snappy_parallel["throughput_mb_s"] = calc_throughput(total_orig, metrics_snappy_parallel["total_time_ms"])
     metrics_oracle["throughput_mb_s"] = calc_throughput(total_orig, metrics_oracle["total_time_ms"])
     metrics_xgb_ideal["throughput_mb_s"] = calc_throughput(total_orig, metrics_xgb_ideal["total_time_ms"])
     metrics_xgb_real["throughput_mb_s"] = calc_throughput(total_orig, metrics_xgb_real["total_time_ms"])
@@ -275,8 +273,11 @@ def benchmark_file(file_path: Path, chunk_size_mb: int, model, classes: list[str
         },
         "strategies": {
             "always_zstd": metrics_zstd,
+            "always_zstd_parallel": metrics_zstd_parallel,
             "always_lz4": metrics_lz4,
+            "always_lz4_parallel": metrics_lz4_parallel,
             "always_snappy": metrics_snappy,
+            "always_snappy_parallel": metrics_snappy_parallel,
             "oracle": metrics_oracle,
             "xgb_pred_ideal": metrics_xgb_ideal,
             "xgb_pred_real": metrics_xgb_real,

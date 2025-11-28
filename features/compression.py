@@ -8,6 +8,18 @@ import lz4.frame
 import snappy
 import zstandard as zstd
 
+def compress(data: bytes, codec: str):
+    """
+    주어진 코덱으로 압축 수행
+    """
+    if codec == "lz4":
+        return compress_with_lz4(data)
+    elif codec == "snappy":
+        return compress_with_snappy(data)
+    elif codec == "zstd":
+        return compress_with_zstd(data)
+    else:
+        raise ValueError(f"Unsupported codec: {codec}")
 
 def compress_with_lz4(data: bytes):
     """
