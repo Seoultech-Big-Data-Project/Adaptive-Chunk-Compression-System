@@ -28,17 +28,6 @@ def run_pipeline(chunk_size_mb: int = 1) -> None:
     print("=" * 60)
 
     # --------------------------------------------------------
-    # 1) 청크 생성 (이미 있으면 스킵)
-    # --------------------------------------------------------
-    chunk_dir = get_chunk_dir(chunk_size_mb)
-    if any(chunk_dir.glob("*.bin")):
-        print(f"[main] 1/4 chunking: {chunk_dir} 에 청크가 이미 있어서 스킵합니다.")
-    else:
-        print(f"[main] 1/4 chunking: raw → {chunk_dir} 로 분할")
-        split_all_raw_to_chunks(chunk_size_mb=size_mb)
-        print(f"[main]    chunking 완료.")
-
-    # --------------------------------------------------------
     # 2) 피쳐 + 라벨 + train/val/test 생성
     # --------------------------------------------------------
     print(f"[main] 2/4 features: 통계 피쳐 + cost 기반 best_codec 라벨 생성")
@@ -51,17 +40,6 @@ def run_pipeline(chunk_size_mb: int = 1) -> None:
     print(f"[main] 3/4 train_xgb: XGBoost 모델 학습 및 평가")
     train_and_evaluate_xgb_for_chunk(chunk_size_mb)
     print(f"[main]    train_xgb 완료 (모델/메트릭 저장)")
-
-    # --------------------------------------------------------
-    # 4) 벤치마크
-    # --------------------------------------------------------
-    print(f"[main] 4/4 benchmark: 여러 전략 비교 (oracle / xgb / always_*)")
-    run_benchmark(chunk_size_mb)
-    print(f"[main]    benchmark 완료")
-
-    print("=" * 60)
-    print(f"[main] PIPELINE DONE (chunk_size = {chunk_size_mb}MB)")
-    print("=" * 60)
 
 
 if __name__ == "__main__":
