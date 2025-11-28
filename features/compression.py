@@ -57,20 +57,31 @@ def compress_with_zstd(data: bytes):
 
 def test_all_compressions(data: bytes):
     """
-    모든 압축 알고리즘 테스트 및 결과 반환
+    모든 압축 알고리즘 테스트 후,
+    cost = ratio * time_ms 계산하여
+    가장 cost가 작은 코덱 이름만 반환
     """
+    # 각각 크기, 시간, ratio 계산
     lz4_size, lz4_time, lz4_ratio = compress_with_lz4(data)
     snappy_size, snappy_time, snappy_ratio = compress_with_snappy(data)
     zstd_size, zstd_time, zstd_ratio = compress_with_zstd(data)
-    
-    return {
-        "lz4_size": lz4_size,
-        "lz4_time_ms": lz4_time,
-        "lz4_ratio": lz4_ratio,
-        "snappy_size": snappy_size,
-        "snappy_time_ms": snappy_time,
-        "snappy_ratio": snappy_ratio,
-        "zstd_size": zstd_size,
-        "zstd_time_ms": zstd_time,
-        "zstd_ratio": zstd_ratio,
+
+    # cost 계산: ratio * time_ms
+    lz4_cost = lz4_ratio * lz4_time
+    snappy_cost = snappy_ratio * snappy_time
+    zstd_cost = zstd_ratio * zstd_time
+
+    # 코덱별 cost dict
+    cost_dict = {
+        "lz4": lz4_cost,
+        "snappy": snappy_cost,
+        "zstd": zstd_cost
     }
+
+    # 가장 cost 작은 코덱 선택
+    best_codec = min(cost_dict, key=cost_dict.get)
+
+    return {
+        "best_cost": best_codec
+    }
+
