@@ -22,3 +22,13 @@ FEATURE_EXTRACT_CHUNK_SIZES = {
     8 * 1024 * 1024: DATA_DIR / "8MB.csv",
     16 * 1024 * 1024: DATA_DIR / "16MB.csv"
 }
+
+# ----------------------
+# 벤치마크 결과 저장 경로
+# ----------------------
+BENCHMARK_DIR = PROJECT_ROOT / "benchmarks"
+DATA_BENCHMARK_DIR = BENCHMARK_DIR / "data"
+MODELS_DIR = PROJECT_ROOT / "models"
+RESULTS_DIR = BENCHMARK_DIR / "results"
+
+TEST_CODECS = ["zstd", "lz4", "snappy"]

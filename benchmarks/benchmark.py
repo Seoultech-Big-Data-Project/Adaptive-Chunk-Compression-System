@@ -5,6 +5,8 @@ import json
 import sys
 import time
 from typing import Dict, Any
+from multiprocessing import Pool, cpu_count
+from config import MAX_WORKERS
 
 import numpy as np
 import pandas as pd
@@ -12,6 +14,7 @@ from xgboost import XGBClassifier
 
 from pipeline.common import DATA_DIR, MODELS_DIR, RESULTS_DIR, get_chunk_dir
 from pipeline.features import compute_basic_stats
+from features.compression import compress
 
 
 CODECS = ["zstd", "lz4", "snappy"]
@@ -141,6 +144,71 @@ def measure_feature_and_predict_overhead(
     }
 
 
+def _compress_chunk_task(args):
+    chunk_path, codec = args
+    data = chunk_path.read_bytes()
+    comp_size, comp_time, _ = compress(data, codec)
+    return len(data), comp_size, comp_time
+
+
+def measure_real_compression(
+    chunk_size_mb: int,
+    df: pd.DataFrame,
+    pred_codecs: pd.Series,
+    use_multiprocessing: bool = True,
+) -> Dict[str, float]:
+    """
+    예측된 코덱으로 실제 압축 수행 및 측정
+    """
+    chunk_dir = get_chunk_dir(chunk_size_mb)
+    chunk_indices = df["chunk_idx"].tolist()
+    
+    print("[benchmark] performing REAL compression with predicted codecs...")
+    
+    tasks = []
+    for idx, codec in zip(chunk_indices, pred_codecs):
+        path = chunk_dir / f"{idx}.bin"
+        tasks.append((path, codec))
+    
+    total_orig_bytes = 0.0
+    total_comp_bytes = 0.0
+    total_comp_time_ms = 0.0
+    
+    if use_multiprocessing and len(tasks) > 1:
+        num_workers = min(cpu_count(), MAX_WORKERS, len(tasks))
+        print(f"[benchmark] using {num_workers} workers for parallel compression...")
+        
+        with Pool(processes=num_workers) as pool:
+            results = pool.map(_compress_chunk_task, tasks)
+        
+        for orig_size, comp_size, comp_time in results:
+            total_orig_bytes += orig_size
+            total_comp_bytes += comp_size
+            total_comp_time_ms += comp_time
+    else:
+        print("[benchmark] using single process for compression...")
+        for path, codec in tasks:
+            data = path.read_bytes()
+            comp_size, comp_time, _ = compress(data, codec)
+            
+            total_orig_bytes += len(data)
+            total_comp_bytes += comp_size
+            total_comp_time_ms += comp_time
+    
+    overall_ratio = total_comp_bytes / total_orig_bytes if total_orig_bytes > 0 else 1.0
+    total_time_sec = total_comp_time_ms / 1000.0
+    throughput_mb_s = (total_orig_bytes / (1024 * 1024)) / total_time_sec if total_time_sec > 0 else float("inf")
+    
+    return {
+        "total_orig_bytes": total_orig_bytes,
+        "total_comp_bytes": total_comp_bytes,
+        "overall_ratio": overall_ratio,
+        "total_time_ms": total_comp_time_ms,
+        "throughput_mb_s": throughput_mb_s,
+    }
+
+
+
 def run_benchmark(chunk_size_mb: int = 1) -> None:
     # 1. 데이터
     df = load_data_for_benchmark(chunk_size_mb)
@@ -159,7 +227,7 @@ def run_benchmark(chunk_size_mb: int = 1) -> None:
     always_lz4_choices = pd.Series(["lz4"] * len(df), index=df.index)
     metrics_always_lz4 = compute_strategy_metrics(df, always_lz4_choices)
 
-    # 5. always_snappy  ✅ 추가
+    # 5. always_snappy 
     always_snappy_choices = pd.Series(["snappy"] * len(df), index=df.index)
     metrics_always_snappy = compute_strategy_metrics(df, always_snappy_choices)
 
@@ -176,7 +244,7 @@ def run_benchmark(chunk_size_mb: int = 1) -> None:
     xgb_pred_codecs = pd.Series(class_arr[y_pred_enc], index=df.index)
     metrics_xgb_pred = compute_strategy_metrics(df, xgb_pred_codecs)
 
-    # 8. 오버헤드 + 실전 시나리오(real)
+    # 8. 오버헤드 측정 (feature extraction + prediction)
     overhead = measure_feature_and_predict_overhead(
         chunk_size_mb=chunk_size_mb,
         df=df,
@@ -186,21 +254,36 @@ def run_benchmark(chunk_size_mb: int = 1) -> None:
     )
     feature_time_ms = overhead["feature_time_ms"]
     predict_time_ms = overhead["predict_time_ms"]
+    pred_codecs_for_real = overhead["pred_codecs"]
+    
+    # 9. 실전 시나리오(real): 실제 압축 수행
+    metrics_real_compression = measure_real_compression(
+        chunk_size_mb=chunk_size_mb,
+        df=df,
+        pred_codecs=pred_codecs_for_real,
+    )
 
-    metrics_xgb_pred_real = compute_strategy_metrics(df, xgb_pred_codecs)
+    metrics_xgb_pred_real = metrics_real_compression.copy()
     metrics_xgb_pred_real["total_time_ms"] += feature_time_ms + predict_time_ms
+    
+    total_time_sec = metrics_xgb_pred_real["total_time_ms"] / 1000.0
+    total_orig_bytes = metrics_xgb_pred_real["total_orig_bytes"]
+    if total_time_sec > 0:
+        metrics_xgb_pred_real["throughput_mb_s"] = (total_orig_bytes / (1024 * 1024)) / total_time_sec
+    else:
+        metrics_xgb_pred_real["throughput_mb_s"] = float("inf")
 
-    # 9. 결과 모으기
+    # 10. 결과 모으기
     strategies = {
         "always_zstd": metrics_always_zstd,
         "always_lz4": metrics_always_lz4,
-        "always_snappy": metrics_always_snappy,  # ✅ 여기 추가
+        "always_snappy": metrics_always_snappy,
         "oracle": metrics_oracle,
         "xgb_pred_ideal": metrics_xgb_pred,
         "xgb_pred_real": metrics_xgb_pred_real,
     }
 
-    # 10. 콘솔 표 출력
+    # 11. 콘솔 표 출력
     print("\n[benchmark] 결과 (test set)")
     print(f"{'strategy':15s} | {'ratio':>8s} | {'time_ms':>10s} | {'throughput_MB/s':>15s}")
     print("-" * 60)
@@ -210,12 +293,12 @@ def run_benchmark(chunk_size_mb: int = 1) -> None:
         thr = m["throughput_mb_s"]
         print(f"{name:15s} | {ratio:8.4f} | {time_ms:10.1f} | {thr:15.2f}")
 
-    print("\n[benchmark] overhead (실전 기준 추가 시간)")
-    print(f"  - feature extraction time (ms): {feature_time_ms:.1f}")
-    print(f"  - model prediction time (ms):   {predict_time_ms:.1f}")
-    print(f"  - overhead per chunk (ms):      {(feature_time_ms + predict_time_ms) / total_chunks:.4f}")
+    # print("\n[benchmark] overhead:")
+    # print(f"  - feature extraction time (ms): {feature_time_ms:.1f}")
+    # print(f"  - model prediction time (ms):   {predict_time_ms:.1f}")
+    # print(f"  - overhead per chunk (ms):      {(feature_time_ms + predict_time_ms) / total_chunks:.4f}")
 
-    # 11. JSON 저장
+    # 12. JSON 저장
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     out_path = RESULTS_DIR / f"{chunk_size_mb}MB_xgb_benchmark.json"
 
