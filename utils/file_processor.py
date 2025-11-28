@@ -14,101 +14,134 @@ from features import (
     byte_stats,
     run_length_stats,
     proportion_features,
-    test_all_compressions
+    test_all_compressions,
 )
 
 
-def compute_chunk_features(data: bytes, file_path: Path, chunk_idx: int, chunk_size_target: int):
+# ===============================
+# 단일 청크 feature 추출
+# ===============================
+def compute_chunk_features(
+    data: bytes,
+    chunk_idx: int,
+    include_compression: bool = True,
+):
     """
-    단일 청크에 대한 모든 특성(feature) 추출 및 압축 테스트
+    단일 청크에 대한 feature 추출 (+ 선택적 압축 테스트)
     """
     size = len(data)
 
-    # === 1. 통계적 특성 추출 ===
-    if size == 0:
-        mean, std, bmin, bmax = 0.0, 0.0, 0, 0
-        entropy = 0.0
-        num_runs, run_mean, run_std, run_max = 0, 0.0, 0.0, 0
-        props = proportion_features(data)
-        compression_results = {
-            "best_cost": 0,
-        }
-    else:
-        std, bmax = byte_stats(data)              # 바이트 기본 통계
-        entropy = shannon_entropy(data)                       # 엔트로피 (복잡도)
-        num_runs, run_mean, run_std = run_length_stats(data)  # Run length 통계
-        props = proportion_features(data)                     # 바이트 타입별 비율
-        compression_results = test_all_compressions(data)     # 압축 성능 테스트
+    # 기본값 초기화
+    entropy = 0.0
+    byte_std = 0.0
+    byte_max = 0
+    num_runs = 0
+    run_mean = 0.0
+    run_std = 0.0
 
-    # === 2. 모든 특성을 하나의 딕셔너리로 결합 ===
+    props = proportion_features(data)
+    compression_results = {}
+
+    if size > 0:
+        byte_std, byte_max = byte_stats(data)
+        entropy = shannon_entropy(data)
+        num_runs, run_mean, run_std = run_length_stats(data)
+
+        if include_compression:
+            compression_results = test_all_compressions(data)
+
     row = {
-        # 메타 정보
-        # "file_path": str(file_path),              # 원본 파일 경로
-        "chunk_index": chunk_idx,                 # 청크 순번
-        
-        # 기본 통계
-        "entropy": entropy,                       # 샤논 엔트로피
-        "byte_std": std,                          # 바이트 표준편차
-        "byte_max": bmax,                         # 바이트 최대값
-        
-        # Run length 통계
-        "num_runs": num_runs,                     # 총 run 개수
-        "run_mean": run_mean,                     # 평균 run 길이
-        "run_std": run_std,                       # run 길이 표준편차
-        
-        # 바이트 타입별 비율
+        "chunk_index": chunk_idx,
+
+        # 통계적 특성
+        "entropy": entropy,
+        "byte_std": byte_std,
+        "byte_max": byte_max,
+
+        # Run-length 통계
+        "num_runs": num_runs,
+        "run_mean": run_mean,
+        "run_std": run_std,
+
+        # 바이트 분포 비율
         **props,
-        
-        # 압축 성능 결과
-        **compression_results,
     }
+
+    if include_compression:
+        row.update(compression_results)
 
     return row
 
 
+# ===============================
+# 멀티프로세싱용 래퍼
+# ===============================
 def _process_chunk_wrapper(args):
-    chunk, file_path, idx, target_size = args
-    return compute_chunk_features(chunk, file_path, idx, target_size)
-
-
-def process_file(file_path: Path, target_chunk_size: int, use_multiprocessing: bool = True):
     """
-    특정 청크 크기로 파일을 분할하여 각 청크의 특성 추출
+    multiprocessing.Pool에서 사용되는 래퍼 함수
     """
-    file_size = file_path.stat().st_size 
+    chunk, chunk_idx, include_compression = args
+    return compute_chunk_features(
+        data=chunk,
+        chunk_idx=chunk_idx,
+        include_compression=include_compression,
+    )
 
-    print(f"      Reading file ({file_size / (1024*1024):.1f} MB)...")
+
+# ===============================
+# 파일 단위 처리
+# ===============================
+def process_file(
+    file_path: Path,
+    target_chunk_size: int,
+    use_multiprocessing: bool = True,
+    include_compression: bool = True,
+):
+    """
+    파일을 청크 단위로 분할 후 feature 추출
+    """
+    file_size = file_path.stat().st_size
+
+    print(f"      Reading file ({file_size / (1024 * 1024):.1f} MB)...")
     with file_path.open("rb") as f:
         data = f.read()
 
-    num_chunks = math.ceil(file_size / target_chunk_size) if file_size > 0 else 1
-    
+    num_chunks = (
+        math.ceil(file_size / target_chunk_size) if file_size > 0 else 1
+    )
+
+    # 청크 인자 구성
     chunk_args = []
     for i in range(num_chunks):
-        start = i * target_chunk_size          
+        start = i * target_chunk_size
         end = min(start + target_chunk_size, file_size)
         chunk = data[start:end]
-        chunk_args.append((chunk, file_path, i, target_chunk_size))
-    
-    # 멀티 프로세싱 사용 여부에 따라 처리
+        chunk_args.append((chunk, i, include_compression))
+
     if use_multiprocessing and num_chunks > 1:
         num_workers = min(cpu_count(), MAX_WORKERS, num_chunks)
         print(f"      Processing {num_chunks} chunk(s) with {num_workers} workers...")
-        
+
         with Pool(processes=num_workers) as pool:
-            rows = list(tqdm(
-                pool.imap(_process_chunk_wrapper, chunk_args),
-                total=num_chunks,
-                desc="        Chunks",
-                leave=False,
-                unit="chunk"
-            ))
+            rows = list(
+                tqdm(
+                    pool.imap(_process_chunk_wrapper, chunk_args),
+                    total=num_chunks,
+                    desc="        Chunks",
+                    leave=False,
+                    unit="chunk",
+                )
+            )
+
     else:
-        # 단일 프로세스로 순차 처리
         print(f"      Processing {num_chunks} chunk(s) (single process)...")
         rows = []
-        for args in tqdm(chunk_args, desc="        Chunks", leave=False, unit="chunk"):
-            row = _process_chunk_wrapper(args)
-            rows.append(row)
+        for args in tqdm(
+            chunk_args,
+            desc="        Chunks",
+            leave=False,
+            unit="chunk",
+        ):
+            rows.append(_process_chunk_wrapper(args))
 
     return rows

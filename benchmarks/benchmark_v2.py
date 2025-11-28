@@ -22,13 +22,13 @@ import numpy as np
 import pandas as pd
 from xgboost import XGBClassifier
 
-# 프로젝트 루트를 sys.path에 추가
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config import MAX_WORKERS, TEST_CODECS, DATA_BENCHMARK_DIR, MODELS_DIR, RESULTS_DIR
 from pipeline.features import compute_basic_stats, add_best_codec_label_by_cost
 from features.compression import compress
+from utils.file_processor import compute_chunk_features
 
 
 def list_benchmark_files() -> list[Path]:
@@ -81,7 +81,11 @@ def split_file_to_chunks(file_path: Path, chunk_size_bytes: int) -> list[bytes]:
 def _extract_and_predict_task(args):
     """멀티프로세싱용: 청크별 특성 추출"""
     chunk, chunk_idx = args
-    features = compute_basic_stats(chunk)
+    features = compute_chunk_features(
+        data=chunk,
+        chunk_idx=chunk_idx,
+        include_compression=False,
+    )
     return chunk_idx, features, len(chunk)
 
 
