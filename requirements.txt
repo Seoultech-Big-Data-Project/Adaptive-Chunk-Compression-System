@@ -1,0 +1,8 @@
+tqdm
+lz4
+python-snappy
+zstandard
+numpy
+pandas
+xgboost
+scikit-learn

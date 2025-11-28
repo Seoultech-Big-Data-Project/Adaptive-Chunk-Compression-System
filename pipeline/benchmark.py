@@ -1,200 +1,246 @@
-# pipeline/benchmark.py
-import pickle
+# benchmark.py
+from __future__ import annotations
+
+import json
+import sys
+import time
+from typing import Dict, Any
 
 import numpy as np
 import pandas as pd
-import xgboost as xgb
+from xgboost import XGBClassifier
 
-from .common import (
-    PREPROCESSED_DIR,
-    MODELS_DIR,
-    RESULTS_DIR,
-    CHUNK_SIZES,
-    CODECS,
-    TRAIN_RATIO,
-    RANDOM_SEED,
-    log,
-    set_global_seed,
-)
+from pipeline.common import DATA_DIR, MODELS_DIR, RESULTS_DIR, get_chunk_dir
+from pipeline.features import compute_basic_stats
 
 
-def _cast_object_to_category(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    object 타입 컬럼들을 category로 변환.
-    label 컬럼은 제외 (라벨 인코딩 따로 함).
-    """
-    obj_cols = df.select_dtypes(include=["object"]).columns.tolist()
-    for col in obj_cols:
-        if col == "label":
-            continue
-        df[col] = df[col].astype("category")
+CODECS = ["zstd", "lz4", "snappy"]
+
+
+def load_data_for_benchmark(chunk_size_mb: int):
+    data_dir = DATA_DIR / f"{chunk_size_mb}MB"
+    test_path = data_dir / "test.csv"
+    full_path = data_dir / "full.csv"
+
+    print(f"[benchmark] loading test: {test_path}")
+    print(f"[benchmark] loading full: {full_path}")
+
+    test_df = pd.read_csv(test_path)
+    full_df = pd.read_csv(full_path)
+
+    if "chunk_idx" not in test_df.columns or "chunk_idx" not in full_df.columns:
+        raise ValueError("test.csv와 full.csv 모두 chunk_idx 컬럼이 필요합니다.")
+
+    df = pd.merge(
+        test_df,
+        full_df,
+        on="chunk_idx",
+        suffixes=("", "_full"),
+    )
     return df
 
 
-def _load_model_and_encoder(chunk_size: str):
-    """
-    models/{chunk_size}.xgb 와
-    models/{chunk_size}_label_encoder.pkl 을 로드.
-    """
-    model_path = MODELS_DIR / f"{chunk_size}.xgb"
-    le_path = MODELS_DIR / f"{chunk_size}_label_encoder.pkl"
+def load_model_and_meta(chunk_size_mb: int):
+    model_path = MODELS_DIR / f"{chunk_size_mb}MB_xgb.json"
+    metrics_path = RESULTS_DIR / f"{chunk_size_mb}MB_xgb_metrics.json"
 
-    model = xgb.XGBClassifier()
+    print(f"[benchmark] loading model:   {model_path}")
+    print(f"[benchmark] loading metrics: {metrics_path}")
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"XGBoost 모델 파일이 없습니다: {model_path}")
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"메트릭 파일이 없습니다: {metrics_path}")
+
+    model = XGBClassifier()
     model.load_model(model_path)
 
-    with open(le_path, "rb") as f:
-        le = pickle.load(f)
+    with metrics_path.open("r", encoding="utf-8") as f:
+        meta = json.load(f)
 
-    return model, le
+    classes = meta["classes"]
+    feature_columns = meta["feature_columns"]
 
-
-def _get_test_df(chunk_size: str) -> pd.DataFrame:
-    """
-    preprocessed/{chunk_size}.csv 를 읽어서
-    TRAIN_RATIO 기준으로 뒤 20%를 test로 사용.
-    object → category 변환도 여기서 처리.
-    """
-    path = PREPROCESSED_DIR / f"{chunk_size}.csv"
-    df = pd.read_csv(path)
-
-    # trainer와 동일하게 문자열을 카테고리로 변환
-    df = _cast_object_to_category(df)
-
-    n = len(df)
-    split_idx = int(n * TRAIN_RATIO)
-    test_df = df.iloc[split_idx:].reset_index(drop=True)
-    log(f"[{chunk_size}] 테스트(벤치마크) 데이터 수: {len(test_df)} / 전체 {n}")
-    return test_df
+    return model, classes, feature_columns
 
 
-def _compute_metrics_for_codec(df: pd.DataFrame, codec_name: str):
-    """
-    단일 코덱 시나리오:
-    - 해당 codec의 ratio/time 컬럼 평균을 구함.
-    """
-    cols = CODECS[codec_name]
-    ratio_col = cols["ratio_col"]
-    time_col = cols["time_col"]
+def compute_strategy_metrics(df: pd.DataFrame, codec_choices: pd.Series) -> Dict[str, Any]:
+    if len(codec_choices) != len(df):
+        raise ValueError("codec_choices 길이가 df와 다릅니다.")
 
-    avg_ratio = df[ratio_col].mean()
-    avg_time = df[time_col].mean()
-    return float(avg_ratio), float(avg_time)
+    total_orig_bytes = float(df["orig_size"].sum())
+    total_comp_bytes = 0.0
+    total_time_ms = 0.0
 
+    for codec in CODECS:
+        mask = (codec_choices == codec)
+        if not mask.any():
+            continue
 
-def _compute_oracle_metrics(df: pd.DataFrame):
-    """
-    Oracle 시나리오:
-    - 각 행의 label(best_codec)에 따라 해당 codec의 ratio/time을 선택해서 평균 계산.
-    """
-    ratios = []
-    times = []
+        comp_bytes = (df.loc[mask, f"{codec}_ratio"] * df.loc[mask, "orig_size"]).sum()
+        time_ms = df.loc[mask, f"{codec}_time_ms"].sum()
 
-    for _, row in df.iterrows():
-        codec = row["label"]
-        cols = CODECS[codec]
-        ratios.append(row[cols["ratio_col"]])
-        times.append(row[cols["time_col"]])
+        total_comp_bytes += float(comp_bytes)
+        total_time_ms += float(time_ms)
 
-    return float(np.mean(ratios)), float(np.mean(times))
+    if total_orig_bytes <= 0:
+        overall_ratio = 1.0
+        throughput_mb_s = 0.0
+    else:
+        overall_ratio = total_comp_bytes / total_orig_bytes
+        total_time_sec = total_time_ms / 1000.0
+        if total_time_sec > 0:
+            throughput_mb_s = (total_orig_bytes / (1024 * 1024)) / total_time_sec
+        else:
+            throughput_mb_s = float("inf")
 
-
-def _compute_model_based_metrics(df: pd.DataFrame, chunk_size: str):
-    """
-    Model-based 시나리오:
-    - XGBoost 모델을 이용해 각 행의 codec을 예측하고,
-    - 예측된 codec의 ratio/time으로 평균 계산.
-    """
-    model, le = _load_model_and_encoder(chunk_size)
-
-    # trainer와 동일하게: label 제외 전부 feature로 사용 (숫자 + 카테고리)
-    feature_cols = [c for c in df.columns if c != "label"]
-
-    if not feature_cols:
-        raise ValueError(f"[{chunk_size}] 벤치마크용 feature가 없습니다.")
-
-    # DataFrame 그대로 넘겨야 category dtype이 유지됨
-    X_test = df[feature_cols]
-
-    # 예측
-    y_pred = model.predict(X_test)
-    pred_labels = le.inverse_transform(y_pred)
-
-    ratios = []
-    times = []
-    for i, codec in enumerate(pred_labels):
-        row = df.iloc[i]
-        cols = CODECS[codec]
-        ratios.append(row[cols["ratio_col"]])
-        times.append(row[cols["time_col"]])
-
-    return float(np.mean(ratios)), float(np.mean(times))
+    return {
+        "total_orig_bytes": total_orig_bytes,
+        "total_comp_bytes": total_comp_bytes,
+        "overall_ratio": overall_ratio,
+        "total_time_ms": total_time_ms,
+        "throughput_mb_s": throughput_mb_s,
+    }
 
 
-def benchmark_chunk(chunk_size: str) -> None:
-    """
-    하나의 chunk_size에 대해:
-      - single codec (zstd/lz4/snappy)
-      - oracle (label 기반)
-      - model-based (XGBoost 예측)
-    를 모두 계산하고,
-    results/benchmark_{chunk_size}.csv 로 저장.
-    """
-    set_global_seed(RANDOM_SEED)
+def measure_feature_and_predict_overhead(
+    chunk_size_mb: int,
+    df: pd.DataFrame,
+    model: XGBClassifier,
+    feature_columns: list[str],
+    classes: list[str],
+) -> Dict[str, Any]:
+    chunk_dir = get_chunk_dir(chunk_size_mb)
+    chunk_indices = df["chunk_idx"].tolist()
 
-    df_test = _get_test_df(chunk_size)
+    # 1) 피쳐 추출 시간
+    print("[benchmark] measuring feature extraction overhead (compute_basic_stats on test chunks)...")
+    t0 = time.perf_counter()
+    for idx in chunk_indices:
+        path = chunk_dir / f"{idx}.bin"
+        data = path.read_bytes()
+        _ = compute_basic_stats(data)
+    t1 = time.perf_counter()
+    feature_time_ms = (t1 - t0) * 1000.0
 
-    results = []
+    # 2) 예측 시간
+    print("[benchmark] measuring model prediction overhead (XGBoost.predict on test set)...")
+    X_test = df[feature_columns]
+    t2 = time.perf_counter()
+    y_pred_enc = model.predict(X_test)
+    t3 = time.perf_counter()
+    predict_time_ms = (t3 - t2) * 1000.0
 
-    # 1) Single codec 시나리오
-    for codec in CODECS.keys():
-        avg_ratio, avg_time = _compute_metrics_for_codec(df_test, codec)
-        results.append(
-            {
-                "chunk_size": chunk_size,
-                "scenario": "single",
-                "codec": codec,
-                "avg_ratio": avg_ratio,
-                "avg_time": avg_time,
-            }
-        )
+    class_arr = np.array(classes)
+    pred_codecs = pd.Series(class_arr[y_pred_enc], index=df.index)
 
-    # 2) Oracle 시나리오
-    oracle_ratio, oracle_time = _compute_oracle_metrics(df_test)
-    results.append(
-        {
-            "chunk_size": chunk_size,
-            "scenario": "oracle",
-            "codec": "mixed",  # 청크마다 codec이 다름
-            "avg_ratio": oracle_ratio,
-            "avg_time": oracle_time,
-        }
+    return {
+        "feature_time_ms": feature_time_ms,
+        "predict_time_ms": predict_time_ms,
+        "pred_codecs": pred_codecs,
+    }
+
+
+def run_benchmark(chunk_size_mb: int = 1) -> None:
+    # 1. 데이터
+    df = load_data_for_benchmark(chunk_size_mb)
+    total_chunks = len(df)
+    total_orig_mb = df["orig_size"].sum() / (1024 * 1024)
+    print(f"[benchmark] num test chunks = {total_chunks}, total_orig ≈ {total_orig_mb:.2f} MB")
+
+    # 2. 모델 + 메타
+    model, classes, feature_columns = load_model_and_meta(chunk_size_mb)
+
+    # 3. always_zstd
+    always_zstd_choices = pd.Series(["zstd"] * len(df), index=df.index)
+    metrics_always_zstd = compute_strategy_metrics(df, always_zstd_choices)
+
+    # 4. always_lz4
+    always_lz4_choices = pd.Series(["lz4"] * len(df), index=df.index)
+    metrics_always_lz4 = compute_strategy_metrics(df, always_lz4_choices)
+
+    # 5. always_snappy  ✅ 추가
+    always_snappy_choices = pd.Series(["snappy"] * len(df), index=df.index)
+    metrics_always_snappy = compute_strategy_metrics(df, always_snappy_choices)
+
+    # 6. oracle
+    if "best_codec" not in df.columns:
+        raise ValueError("df에 best_codec 컬럼이 없습니다. features.py에서 라벨이 제대로 생성되었는지 확인하십시오.")
+    oracle_choices = df["best_codec"].astype(str)
+    metrics_oracle = compute_strategy_metrics(df, oracle_choices)
+
+    # 7. XGBoost 예측 (ideal)
+    X_test = df[feature_columns]
+    y_pred_enc = model.predict(X_test)
+    class_arr = np.array(classes)
+    xgb_pred_codecs = pd.Series(class_arr[y_pred_enc], index=df.index)
+    metrics_xgb_pred = compute_strategy_metrics(df, xgb_pred_codecs)
+
+    # 8. 오버헤드 + 실전 시나리오(real)
+    overhead = measure_feature_and_predict_overhead(
+        chunk_size_mb=chunk_size_mb,
+        df=df,
+        model=model,
+        feature_columns=feature_columns,
+        classes=classes,
     )
+    feature_time_ms = overhead["feature_time_ms"]
+    predict_time_ms = overhead["predict_time_ms"]
 
-    # 3) Model-based 시나리오
-    model_ratio, model_time = _compute_model_based_metrics(df_test, chunk_size)
-    results.append(
-        {
-            "chunk_size": chunk_size,
-            "scenario": "model_based",
-            "codec": "mixed",  # 청크마다 codec이 다름
-            "avg_ratio": model_ratio,
-            "avg_time": model_time,
-        }
-    )
+    metrics_xgb_pred_real = compute_strategy_metrics(df, xgb_pred_codecs)
+    metrics_xgb_pred_real["total_time_ms"] += feature_time_ms + predict_time_ms
 
-    # 결과 저장
-    out_df = pd.DataFrame(results)
-    out_path = RESULTS_DIR / f"benchmark_{chunk_size}.csv"
-    out_df.to_csv(out_path, index=False)
+    # 9. 결과 모으기
+    strategies = {
+        "always_zstd": metrics_always_zstd,
+        "always_lz4": metrics_always_lz4,
+        "always_snappy": metrics_always_snappy,  # ✅ 여기 추가
+        "oracle": metrics_oracle,
+        "xgb_pred_ideal": metrics_xgb_pred,
+        "xgb_pred_real": metrics_xgb_pred_real,
+    }
 
-    log(f"[{chunk_size}] 벤치마크 완료 → {out_path}")
+    # 10. 콘솔 표 출력
+    print("\n[benchmark] 결과 (test set)")
+    print(f"{'strategy':15s} | {'ratio':>8s} | {'time_ms':>10s} | {'throughput_MB/s':>15s}")
+    print("-" * 60)
+    for name, m in strategies.items():
+        ratio = m["overall_ratio"]
+        time_ms = m["total_time_ms"]
+        thr = m["throughput_mb_s"]
+        print(f"{name:15s} | {ratio:8.4f} | {time_ms:10.1f} | {thr:15.2f}")
 
+    print("\n[benchmark] overhead (실전 기준 추가 시간)")
+    print(f"  - feature extraction time (ms): {feature_time_ms:.1f}")
+    print(f"  - model prediction time (ms):   {predict_time_ms:.1f}")
+    print(f"  - overhead per chunk (ms):      {(feature_time_ms + predict_time_ms) / total_chunks:.4f}")
 
-def run_all_benchmarks() -> None:
-    for cs in CHUNK_SIZES:
-        benchmark_chunk(cs)
+    # 11. JSON 저장
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out_path = RESULTS_DIR / f"{chunk_size_mb}MB_xgb_benchmark.json"
+
+    output = {
+        "chunk_size_mb": chunk_size_mb,
+        "num_test_chunks": total_chunks,
+        "total_orig_bytes": float(df["orig_size"].sum()),
+        "overhead": {
+            "feature_time_ms": feature_time_ms,
+            "predict_time_ms": predict_time_ms,
+            "overhead_per_chunk_ms": (feature_time_ms + predict_time_ms) / total_chunks,
+        },
+        "strategies": strategies,
+    }
+
+    with out_path.open("w", encoding="utf-8") as f:
+        json.dump(output, f, ensure_ascii=False, indent=2)
+
+    print(f"\n[benchmark] benchmark results saved to: {out_path}")
 
 
 if __name__ == "__main__":
-    # 모듈 단독 실행 테스트용
-    run_all_benchmarks()
+    if len(sys.argv) >= 2:
+        size_mb = int(sys.argv[1])
+    else:
+        size_mb = 1
+
+    run_benchmark(chunk_size_mb=size_mb)
