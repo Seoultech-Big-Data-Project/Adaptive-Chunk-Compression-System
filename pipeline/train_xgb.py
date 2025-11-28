@@ -14,32 +14,67 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 from sklearn.preprocessing import LabelEncoder
+from sklearn.model_selection import train_test_split
 
 from .common import DATA_DIR, MODELS_DIR, RESULTS_DIR
 
+# =========================
+# 설정
+# =========================
 
-FEATURE_DROP_COLS = ["best_codec", "chunk_idx"]  # chunk_idx도 학습에서는 버림
-LABEL_COL = "best_codec"
-CODECS = ["zstd", "lz4", "snappy"]  # 기대 클래스 순서 (편의용)
+# 학습에서 사용하지 않을 컬럼들
+FEATURE_DROP_COLS = ["chunk_index"]   # 인덱스성 피쳐는 제거
+LABEL_COL = "best_cost"
+CODECS = ["zstd", "lz4", "snappy"]    # 기대 클래스 순서 (편의용)
 
 
-def load_split(chunk_size_mb: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+# =========================
+# 데이터 분할
+# =========================
+
+def load_split(chunk_size_mb: int, random_state: int = 42) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
-    data/{chunk_size}MB/train.csv, val.csv, test.csv 로부터 데이터셋을 로드한다.
+    data/{chunk_size}MB.csv 로부터 데이터를 로드한 뒤,
+    best_cost 라벨 기준으로 계층적 분할(stratified split)을 수행하여
+    train/val/test 를 7 : 1.5 : 1.5 비율로 나눈다.
     """
-    base_dir = DATA_DIR / f"{chunk_size_mb}MB"
+    csv_path = DATA_DIR / f"{chunk_size_mb}MB.csv"
 
-    train_path = base_dir / "train.csv"
-    val_path = base_dir / "val.csv"
-    test_path = base_dir / "test.csv"
+    print(f"[train_xgb] loading merged data: {csv_path}")
+    df = pd.read_csv(csv_path)
 
-    print(f"[train_xgb] loading train: {train_path}")
-    print(f"[train_xgb] loading val:   {val_path}")
-    print(f"[train_xgb] loading test:  {test_path}")
+    if LABEL_COL not in df.columns:
+        raise ValueError(f"라벨 컬럼 '{LABEL_COL}' 가 존재하지 않습니다.")
 
-    train_df = pd.read_csv(train_path)
-    val_df = pd.read_csv(val_path)
-    test_df = pd.read_csv(test_path)
+    # 7 : 1.5 : 1.5 비율 분할
+    #  - 1차: train (70%) vs temp (30% = val+test)
+    #  - 2차: temp 을 다시 1:1 로 나누어 val/test (각각 15%)
+    train_df, temp_df = train_test_split(
+        df,
+        test_size=0.30,
+        stratify=df[LABEL_COL],
+        random_state=random_state,
+        shuffle=True,
+    )
+
+    val_df, test_df = train_test_split(
+        temp_df,
+        test_size=0.50,  # temp 의 50%씩 -> 전체의 15% / 15%
+        stratify=temp_df[LABEL_COL],
+        random_state=random_state,
+        shuffle=True,
+    )
+
+    # 인덱스 정리
+    train_df = train_df.reset_index(drop=True)
+    val_df = val_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+
+    # 분포 체크용 로그
+    print("\n[train_xgb] label distribution (best_cost)")
+    print("  - train:\n", train_df[LABEL_COL].value_counts(normalize=True))
+    print("  - val:  \n", val_df[LABEL_COL].value_counts(normalize=True))
+    print("  - test: \n", test_df[LABEL_COL].value_counts(normalize=True))
 
     return train_df, val_df, test_df
 
@@ -47,18 +82,26 @@ def load_split(chunk_size_mb: int) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataF
 def split_X_y(df: pd.DataFrame):
     """
     DataFrame에서 X (피쳐), y (라벨), feature_names를 분리.
+    LABEL_COL 및 FEATURE_DROP_COLS 는 feature에서 제거한다.
     """
     if LABEL_COL not in df.columns:
         raise ValueError(f"라벨 컬럼({LABEL_COL})이 없습니다: {df.columns}")
 
+    # y는 문자열 라벨로 유지
     y = df[LABEL_COL].astype(str)
 
-    # 학습에 사용하지 않을 컬럼 제거
-    feature_cols = [c for c in df.columns if c not in FEATURE_DROP_COLS]
-    X = df[feature_cols]
+    # 학습에 사용하지 않을 컬럼 제거 (라벨 + 드랍 컬럼)
+    drop_cols = set(FEATURE_DROP_COLS + [LABEL_COL])
+    feature_cols = [c for c in df.columns if c not in drop_cols]
+
+    X = df[feature_cols].astype(float)  # XGBoost용으로 전부 float 형변환
 
     return X, y, feature_cols
 
+
+# =========================
+# 모델 학습 / 평가
+# =========================
 
 def train_xgb_model(
     X_train: pd.DataFrame,
@@ -132,7 +175,6 @@ def evaluate_model(
 
     cm = confusion_matrix(y_true_enc, y_pred_enc, labels=range(len(le.classes_)))
 
-    # dict로 정리
     metrics = {
         "accuracy": acc,
         "per_class": {},
@@ -151,12 +193,16 @@ def evaluate_model(
     return metrics
 
 
+# =========================
+# 전체 파이프라인
+# =========================
+
 def train_and_evaluate_xgb_for_chunk(chunk_size_mb: int = 1) -> None:
     """
     전체 파이프라인:
-      1) train/val/test CSV 로드
+      1) data/{chunk_size}MB.csv 로드 후 train/val/test 분할
       2) X, y 분리 + LabelEncoder
-      3) XGBoost 학습 (train + val 사용, val은 early stopping)
+      3) XGBoost 학습 (train + val 사용)
       4) train/val/test 평가
       5) 모델 저장 (models/{chunk_size}MB_xgb.json)
       6) 지표 저장 (results/{chunk_size}MB_xgb_metrics.json)
@@ -189,7 +235,7 @@ def train_and_evaluate_xgb_for_chunk(chunk_size_mb: int = 1) -> None:
     test_metrics = evaluate_model(model, le, X_test, y_test)
     print(f"  - test accuracy:  {test_metrics['accuracy']:.4f}")
 
-    # 클래스별 지표도 콘솔에 보기 좋게 출력
+    # per-class 출력
     def print_per_class(title: str, metrics: dict):
         print(f"\n[{title}] per-class metrics")
         for cls_name, m in metrics["per_class"].items():
